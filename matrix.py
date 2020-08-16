@@ -5,12 +5,12 @@ import sys, os
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 
-from sofabase import sofabase
-from sofabase import adapterbase
+from sofabase import sofabase, adapterbase, configbase
 import devices
 import socket
 import json
 import asyncio
+import time
 #import struct
 #TCP_IP = '192.168.0.29' 
 #TCP_PORT = 5000     
@@ -24,7 +24,8 @@ import asyncio
 
 class Client(asyncio.Protocol):
 
-    def __init__(self, loop=None, log=None, notify=None, dataset=None, **kwargs):
+    def __init__(self, loop=None, log=None, notify=None, dataset=None, config=None, **kwargs):
+        self.config=config
         self.is_open = False
         self.loop = loop
         self.log=log
@@ -35,6 +36,7 @@ class Client(asyncio.Protocol):
         self.lastcommand=""
         self.controllerMap=dict()
         self.buffer=""
+        self.waiting_for_status=False
         
         # populate base dataset to eliminate oddly formatted adds
         self.dataset.nativeDevices={"output": {}}
@@ -89,8 +91,9 @@ class Client(asyncio.Protocol):
             if (len(self.sendQueue)>0):
                 if self.programmingMode==False:
                     self.lastcommand=self.sendQueue.pop(0)
-                #self.log.info('.. pulling command from queue: %s' % self.lastcommand)
+                self.log.info('.. pulling command from queue: %s' % self.lastcommand)
                 self.send(self.lastcommand)
+                time.sleep(.2)
 
         except:
             self.log.error('Error bumping queue',exc_info=True)
@@ -104,6 +107,7 @@ class Client(asyncio.Protocol):
             self.log.error('Error on send', exc_info=True)
             
     def get_status(self):
+        self.waiting_for_status=True
         self.queue_for_send("MT00RD0000NT")
         
     async def parse_data(self, result):
@@ -113,13 +117,15 @@ class Client(asyncio.Protocol):
                 data_parts=result[5:-4].split(';')
                 data={}
                 for part in data_parts:
-                    if part[0:2] in self.dataset.config['outputs']:
-                        output_name=self.dataset.config['outputs'][part[0:2]]
+                    if part[0:2] in self.config.outputs:
+                        output_name=self.config.outputs[part[0:2]]
                         input_name=part[2:4]
-                        if input_name in self.dataset.config['inputs']:
-                            input_name=self.dataset.config['inputs'][part[2:4]]
+                        if input_name in self.config.inputs:
+                            input_name=self.config.inputs[part[2:4]]
                         item={ "name": output_name, "input": part[2:4], "input_name" : input_name }
                         await self.dataset.ingest({ "output": { part[0:2]: item } })
+                self.waiting_for_status=False
+                self.log.info('<< matrix (applied update from status data)')
         except:
             print('error getting status: %s' % sys.exc_info())
 
@@ -140,7 +146,17 @@ class Client(asyncio.Protocol):
 
 
 class matrix(sofabase):
-
+    
+    class adapter_config(configbase):
+    
+        def adapter_fields(self):
+            self.inputs=self.set_or_default('inputs', default={})
+            self.outputs=self.set_or_default('outputs', default={})
+            self.output_count=self.set_or_default('output_count', default=8)
+            self.matrix_address=self.set_or_default('matrix_address', mandatory=True)
+            self.matrix_port=self.set_or_default('matrix_port', default=5000)
+            self.matrix_timeout=self.set_or_default('matrix_timeout', default=0.5)
+            
     class EndpointHealth(devices.EndpointHealth):
 
         @property            
@@ -152,16 +168,7 @@ class matrix(sofabase):
         @property            
         def input(self):
             try:
-                # Yamaha returns the name of the input instead of it's id, but the name can be overridden on the device and it will still
-                # reply with the original value. For example, an input_sel of "AV4" would typically represent AV_4, even if AV_4's name was
-                # changed to "TV".  
-                # In order to deal with their cheese, stripping the underscore from the id and comparing with the input_sel will almost always work
-                # to get the right id.
-                
-                # look for it properly
-
                 return self.nativeObject['input_name']
-                
             except:
                 self.adapter.log.error('Error checking input status', exc_info=True)
                 return ""
@@ -169,39 +176,44 @@ class matrix(sofabase):
         async def SelectInput(self, payload, correlationToken=''):
             try:
                 response=None
-                for inp in self.adapter.dataset.config['inputs']:
-                    if payload['input']==self.adapter.dataset.config['inputs'][inp]:
+                for inp in self.device.adapter.config.inputs:
+                    if payload['input']==self.device.adapter.config.inputs[inp]:
                         self.log.info('Setting Device %s to %s' % (self.device.endpointId[-1:], inp[1:]))
                         self.adapter.matrixClient.set_output(self.device.endpointId[-1:], inp[1:])
+                        while self.adapter.matrixClient.waiting_for_status:
+                            await asyncio.sleep(.1)
                         response=await self.adapter.dataset.generateResponse(self.device.endpointId, correlationToken)
-                        # figure out how to set input from here
-                        # return await self.adapter.dothething(self.device, newinput, correlationToken)
                 if response==None:
-                    self.log.info('Could not find %s in %s' % (payload['input'],self.adapter.dataset.config['inputs'] ))
+                    self.log.info('Could not find %s in %s' % (payload['input'],self.config.inputs ))
             except:
                 self.log.error('!! Error during SelectInput', exc_info=True)
             return response
                 
     class adapterProcess(adapterbase):  
         
-        def __init__(self, log=None, dataset=None, notify=None, loop=None, **kwargs):
+        def __init__(self, log=None, dataset=None, notify=None, loop=None, config=None, **kwargs):
+            self.config=config
             self.buffer_size=4
             self.dataset=dataset
-            self.config=self.dataset.config
             self.log=log
+            self.log.info('config: %s' % self.config)
             self.notify=notify
+            self.waiting_for_status=False
             if not loop:
                 self.loop = asyncio.new_event_loop()
             else:
                 self.loop=loop
         
         async def connect(self):
-            self.log.info('.. Connecting to matrix at %s:%s' % (self.config['address'], self.config['port']))
-            self.matrixClient = Client(loop=self.loop, log=self.log, notify=self.notify, dataset=self.dataset)
-            await self.loop.create_connection(lambda: self.matrixClient, self.config['address'], self.config['port'])
+            self.log.info('.. Connecting to matrix at %s:%s' % (self.config.matrix_address, self.config.matrix_port))
+            self.matrixClient = Client(loop=self.loop, log=self.log, notify=self.notify, dataset=self.dataset, config=self.config)
+            await self.loop.create_connection(lambda: self.matrixClient, self.config.matrix_address, self.config.matrix_port)
+            
+        async def pre_activate(self):
+            await self.connect()
             
         async def start(self):
-            await self.connect()
+            pass
 
         async def addSmartDevice(self, path):
             
@@ -218,7 +230,7 @@ class matrix(sofabase):
             if name not in self.dataset.devices:
                 device=devices.alexaDevice('matrix/output/%s' % deviceid, name, displayCategories=["MATRIX"], adapter=self)
                 device.EndpointHealth=matrix.EndpointHealth(device=device)
-                device.InputController=matrix.InputController(device=device, inputs=self.dataset.config['inputs'].values())
+                device.InputController=matrix.InputController(device=device, inputs=self.config.inputs.values())
                 return self.dataset.newaddDevice(device)
             return False
 
@@ -227,8 +239,8 @@ class matrix(sofabase):
         try:
             data=True
             self.matrix_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.matrix_socket.settimeout(self.config['timeout'])    
-            self.matrix_socket.connect((self.config['address'], self.config['port']))
+            self.matrix_socket.settimeout(self.config.matrix_timeout)    
+            self.matrix_socket.connect((self.config.matrix_address, self.config.matrix_port))
         except:
             print('error setting up connection')
             
@@ -258,7 +270,6 @@ class matrix(sofabase):
             except:
                 pass
         try:
-            pass
             self.matrix_socket.close()
         except:
             print('error closing socket: %s' % sys.exc_info())
@@ -274,11 +285,11 @@ class matrix(sofabase):
                 data_parts=result[5:-4].split(';')
                 data={}
                 for part in data_parts:
-                    if part[0:2] in self.config['outputs']:
-                        output_name=self.config['outputs'][part[0:2]]
+                    if part[0:2] in self.config.outputs:
+                        output_name=self.config.outputs[part[0:2]]
                         input_name=part[2:4]
-                        if input_name in self.config['inputs']:
-                            input_name=self.config['inputs'][part[2:4]]
+                        if input_name in self.config.inputs:
+                            input_name=self.config.inputs[part[2:4]]
                         data[part[0:2]]={ "name": output_name, "input": part[2:4], "input_name" : input_name }
                         await self.dataset.ingest({ "output": {item: result[item]} })
         except:
