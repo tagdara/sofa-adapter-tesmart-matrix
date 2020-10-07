@@ -218,22 +218,21 @@ class matrix(sofabase):
         async def addSmartDevice(self, path):
             
             try:
-                if path.split("/")[1]=="output":
-                    return self.addMatrixOutput(path.split("/")[2])
+                device_type=path.split("/")[1]
+                device_id=path.split("/")[2]
+                endpointId="%s:%s:%s" % ("matrix", device_type, device_id)
+                if endpointId not in self.dataset.localDevices:
+                    nativeObject=self.dataset.nativeDevices['output'][device_id]
+                    if device_type=="output":
+                        return self.addMatrixOutput(device_id, nativeObject)
             except:
                 self.log.error('Error defining smart device', exc_info=True)
 
-        def addMatrixOutput(self, deviceid, name="Matrix"):
-            
-            nativeObject=self.dataset.nativeDevices['output'][deviceid]
-            name=nativeObject['name']
-            if name not in self.dataset.devices:
-                device=devices.alexaDevice('matrix/output/%s' % deviceid, name, displayCategories=["MATRIX"], adapter=self)
-                device.EndpointHealth=matrix.EndpointHealth(device=device)
-                device.InputController=matrix.InputController(device=device, inputs=self.config.inputs.values())
-                return self.dataset.newaddDevice(device)
-            return False
-
+        def addMatrixOutput(self, deviceid, nativeObject):
+            device=devices.alexaDevice('matrix/output/%s' % deviceid, nativeObject['name'], displayCategories=["MATRIX"], adapter=self)
+            device.EndpointHealth=matrix.EndpointHealth(device=device)
+            device.InputController=matrix.InputController(device=device, inputs=self.config.inputs.values())
+            return self.dataset.add_device(device)
     
     def send_message(self, message, response=False):
         try:
