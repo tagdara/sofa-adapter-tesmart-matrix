@@ -19,6 +19,8 @@ import time
 #message = "IP?"            # Query IP
 #message = "MT00RD0000NT"   # Returns some weird status
 #message = "MT00BZEN01NT"   # This one mutes the buzzer
+#beep_on = "MT00BZEN00NT"  
+#beep_off = "MT00BZEN01NT"  
 
 #commands=[ "MT00BZEN01NT", "MT00SW0101NT", "MT00SW0102NT", "MT00SW0203NT", "MT00SW0204NT", "MT00SW0205NT"]
 
@@ -37,6 +39,7 @@ class Client(asyncio.Protocol):
         self.controllerMap=dict()
         self.buffer=""
         self.waiting_for_status=False
+        self.waiting_requests=[]
         
         # populate base dataset to eliminate oddly formatted adds
         self.dataset.nativeDevices={"output": {}}
@@ -71,7 +74,7 @@ class Client(asyncio.Protocol):
             else:
                 self.buffer=self.buffer+data.decode()
             if self.buffer.startswith('LINK') and self.buffer.endswith(';END'):
-                asyncio.ensure_future(self.parse_data(self.buffer))
+                self.loop.create_task(self.parse_data(self.buffer))
                 self.buffer=""
             #else:
                 #self.log.info('Buffer currently: [%s]' % self.buffer)
@@ -101,7 +104,7 @@ class Client(asyncio.Protocol):
     def send(self, data):
         
         try:
-            self.log.info('>> matrix  %s' % data.replace('\n', ' ').replace('\r', ''))
+            self.log.info('-> matrix %s' % data.replace('\n', ' ').replace('\r', ''))
             self.transport.write(data.encode())
         except:
             self.log.error('Error on send', exc_info=True)
@@ -112,7 +115,7 @@ class Client(asyncio.Protocol):
         
     async def parse_data(self, result):
         try:
-            self.log.info('<< matrix %s' % result)
+            self.log.info('<- matrix %s' % result)
             if result.startswith('LINK') and result.endswith('END'):
                 data_parts=result[5:-4].split(';')
                 data={}
@@ -124,12 +127,14 @@ class Client(asyncio.Protocol):
                             input_name=self.config.inputs[part[2:4]]
                         item={ "name": output_name, "input": part[2:4], "input_name" : input_name }
                         await self.dataset.ingest({ "output": { part[0:2]: item } })
-                self.waiting_for_status=False
-                self.log.info('<< matrix (applied update from status data)')
+                waiting_request=""
+                if len(self.waiting_requests)>0:
+                    waiting_request=self.waiting_requests.pop(0)
+                self.log.info('<< matrix (applied update from status data) %s' % waiting_request)
         except:
-            print('error getting status: %s' % sys.exc_info())
+            print('!! error getting status: %s' % sys.exc_info())
 
-    def set_output(self, output_id, input_id):
+    def set_output(self, output_id, input_id, tracking_id=""):
         try:
             input_id=str(input_id)
             output_id=str(output_id)
@@ -137,7 +142,7 @@ class Client(asyncio.Protocol):
                 input_id="0"+str(input_id)
             if len(output_id)==1:
                 output_id="0"+str(output_id)
-            print('Setting %s to %s' % (output_id, input_id))
+            self.waiting_requests.append(tracking_id)
             self.queue_for_send("MT00SW%s%sNT" % (input_id, output_id))
             self.get_status()
         except:
@@ -178,9 +183,9 @@ class matrix(sofabase):
                 response=None
                 for inp in self.device.adapter.config.inputs:
                     if payload['input']==self.device.adapter.config.inputs[inp]:
-                        self.log.info('Setting Device %s to %s' % (self.device.endpointId[-1:], inp[1:]))
-                        self.adapter.matrixClient.set_output(self.device.endpointId[-1:], inp[1:])
-                        while self.adapter.matrixClient.waiting_for_status:
+                        self.adapter.matrixClient.set_output(self.device.endpointId[-1:], inp[1:], correlationToken)
+                        while correlationToken in self.adapter.matrixClient.waiting_requests:
+                        #while self.adapter.matrixClient.waiting_for_status:
                             await asyncio.sleep(.1)
                         response=await self.adapter.dataset.generateResponse(self.device.endpointId, correlationToken)
                 if response==None:
@@ -199,6 +204,7 @@ class matrix(sofabase):
             self.log.info('config: %s' % self.config)
             self.notify=notify
             self.waiting_for_status=False
+
             if not loop:
                 self.loop = asyncio.new_event_loop()
             else:
@@ -234,7 +240,7 @@ class matrix(sofabase):
             device.InputController=matrix.InputController(device=device, inputs=self.config.inputs.values())
             return self.dataset.add_device(device)
     
-    def send_message(self, message, response=False):
+    def xxx_send_message(self, message, response=False):
         try:
             data=True
             self.matrix_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -276,47 +282,7 @@ class matrix(sofabase):
         
         return data
 
-    async def get_status(self):
-        try:
-            result=self.send_message("MT00RD0000NT", response=True)
-            #print('Status: %s' % result)
-            if result.startswith('LINK') and result.endswith('END'):
-                data_parts=result[5:-4].split(';')
-                data={}
-                for part in data_parts:
-                    if part[0:2] in self.config.outputs:
-                        output_name=self.config.outputs[part[0:2]]
-                        input_name=part[2:4]
-                        if input_name in self.config.inputs:
-                            input_name=self.config.inputs[part[2:4]]
-                        data[part[0:2]]={ "name": output_name, "input": part[2:4], "input_name" : input_name }
-                        await self.dataset.ingest({ "output": {item: result[item]} })
-        except:
-            print('error getting status: %s' % sys.exc_info())
-        
 
-    def set_beep(self, beep_on):
-        try:
-            if beep_on:
-                result=self.send_message("MT00BZEN00NT")   
-            else:
-                result=self.send_message("MT00BZEN01NT")   
-        except:
-            print('error setting beep')
-        
-    def set_output(self, output_id, input_id):
-        try:
-            input_id=str(input_id)
-            output_id=str(output_id)
-            if len(input_id)==1:
-                input_id="0"+str(input_id)
-            if len(output_id)==1:
-                output_id="0"+str(output_id)
-            print('Setting %s to %s' % (output_id, input_id))
-            result=self.send_message("MT00SW%s%sNT" % (input_id, output_id))
-            return result
-        except:
-            print('Error setting output')
 
 if __name__ == '__main__':
     adapter=matrix(name="matrix")
